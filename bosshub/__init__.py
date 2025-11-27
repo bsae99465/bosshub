@@ -1,142 +1,227 @@
 import json
 import time
 import os
+import sys
 
 # --- Version Control ---
-__version__ = "1.0.0-Enterprise"
+__version__ = "1.5.0-MQTT-Enterprise"
+DEFAULT_MQTT_HOST = "141.98.19.212"
+DEFAULT_MQTT_PORT = 1883
 
-# --- Cross-Platform Detection (PC vs ESP32) ---
+# --- Cross-Platform Detection & Imports ---
 try:
+    # ---------------- ESP32 / MicroPython ----------------
+    from machine import unique_id, reset
     import urequests as requests
-    import machine
+    from umqtt.simple import MQTTClient
     PLATFORM = "ESP32"
+    
     def get_unique_id():
-        # ดึง Unique ID จาก Hardware จริงของ ESP32
-        return ''.join(['{:02x}'.format(b) for b in machine.unique_id()])
+        return ''.join(['{:02x}'.format(b) for b in unique_id()])
+
 except ImportError:
+    # ---------------- PC / Server (Standard Python) ----------------
     import requests
     import uuid
+    import threading
+    try:
+        import paho.mqtt.client as mqtt
+        HAS_PAHO = True
+    except ImportError:
+        HAS_PAHO = False
+        print("[BossHub Warning] 'paho-mqtt' not installed. MQTT features on PC will vary.")
+
     PLATFORM = "Python/PC"
+    
     def get_unique_id():
-        # สร้าง ID จำลองสำหรับ PC (หรือดึงจาก MAC Address ก็ได้)
         node = uuid.getnode()
         return ''.join(['{:02x}'.format((node >> elements) & 0xff) for elements in range(0,2*6,2)][::-1])
 
 class Client:
     """
-    BossHub Enterprise Client
-    รองรับ: Vending, Washing Machine, POS
+    BossHub Enterprise Client (HTTP + MQTT)
+    รองรับ: Real-time Command, Vending, Washing Machine, POS
+    Target: 141.98.19.212
     """
     
-    def __init__(self, api_key=None, server_url="https://api.bosshub.io/v1", device_id=None):
+    def __init__(self, api_key=None, server_url="https://api.bosshub.io/v1", mqtt_host=DEFAULT_MQTT_HOST, device_id=None):
+        # 1. Setup Identity
         self.api_key = api_key or os.getenv('BOSSHUB_API_KEY')
         if not self.api_key:
-            raise ValueError("BossHub Error: API Key is missing.")
+            # ใน Dev Mode อาจจะยอมให้ผ่านไปก่อน แต่เตือน
+            print("[BossHub Warning] API Key missing. HTTP features might fail.")
 
-        # ถ้าไม่กำหนด device_id มา ให้ดึงจาก Hardware เองอัตโนมัติ
         self.device_id = device_id if device_id else get_unique_id()
-        self.base_url = server_url.rstrip('/')
+        self.platform = PLATFORM
         
+        # 2. Setup HTTP
+        self.base_url = server_url.rstrip('/')
         self.headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
             "X-Device-ID": self.device_id,
-            "X-Platform": PLATFORM
+            "X-Platform": self.platform
         }
-        
-        print(f"[BossHub] Init Device: {self.device_id} on {PLATFORM}")
 
+        # 3. Setup MQTT
+        self.mqtt_host = mqtt_host
+        self.mqtt_client = None
+        self.mqtt_callbacks = {} # เก็บ function ที่ user สั่ง subscribe
+        self.is_mqtt_connected = False
+        
+        print(f"[BossHub] Init Device: {self.device_id} ({self.platform}) -> MQTT: {self.mqtt_host}")
+
+    # ==========================================
+    # PART 1: MQTT SYSTEM (The New Engine)
+    # ==========================================
+    
+    def connect_mqtt(self, on_message_callback=None):
+        """เริ่มการเชื่อมต่อ MQTT (Auto Select Driver)"""
+        self.user_on_message = on_message_callback
+        client_id = f"bosshub-{self.device_id}"
+
+        try:
+            if PLATFORM == "ESP32":
+                # --- MicroPython Logic ---
+                self.mqtt_client = MQTTClient(client_id, self.mqtt_host, port=DEFAULT_MQTT_PORT)
+                self.mqtt_client.set_callback(self._on_mqtt_message_wrapper)
+                self.mqtt_client.connect()
+                print("[BossHub MQTT] Connected (ESP32 Mode)")
+            
+            elif PLATFORM == "Python/PC":
+                # --- PC/Server Logic (Paho) ---
+                if not HAS_PAHO:
+                    raise ImportError("Please run: pip install paho-mqtt")
+                
+                self.mqtt_client = mqtt.Client(client_id=client_id)
+                self.mqtt_client.on_connect = self._on_paho_connect
+                self.mqtt_client.on_message = self._on_paho_message
+                self.mqtt_client.connect(self.mqtt_host, DEFAULT_MQTT_PORT, 60)
+                self.mqtt_client.loop_start() # Background Thread
+                print("[BossHub MQTT] Connected (PC Threaded Mode)")
+
+            self.is_mqtt_connected = True
+            
+            # Subscribe ช่องทางมาตรฐานของตัวเองเสมอ
+            # Topic: bosshub/devices/{device_id}/command
+            self.subscribe(f"bosshub/devices/{self.device_id}/command")
+            
+        except Exception as e:
+            print(f"[BossHub MQTT Error] Connect Failed: {e}")
+            self.is_mqtt_connected = False
+
+    def subscribe(self, topic, callback=None):
+        """Subscribe Topic และผูก Callback เฉพาะ Topic นั้น (Optional)"""
+        if not self.mqtt_client: return
+        
+        # ถ้ามี Callback เฉพาะเจาะจง ให้เก็บไว้
+        if callback:
+            self.mqtt_callbacks[topic] = callback
+            
+        # สั่ง Library subscribe
+        if PLATFORM == "ESP32":
+            self.mqtt_client.subscribe(topic)
+        else:
+            self.mqtt_client.subscribe(topic)
+            
+        print(f"[BossHub MQTT] Subscribed: {topic}")
+
+    def publish(self, topic, payload):
+        """Publish ข้อมูล (Auto Convert Dict/List to JSON)"""
+        if not self.mqtt_client: return
+
+        if isinstance(payload, (dict, list)):
+            payload = json.dumps(payload)
+            
+        try:
+            self.mqtt_client.publish(topic, payload)
+        except Exception as e:
+            print(f"[BossHub MQTT Error] Publish failed: {e}")
+            # TODO: Logic Auto-Reconnect for ESP32 could go here
+
+    def mqtt_loop(self):
+        """
+        *** สำคัญสำหรับ ESP32 ***
+        ต้องเอาไปใส่ใน while True ของ main.py
+        สำหรับ PC ไม่ต้องใส่ เพราะใช้ Thread แล้ว
+        """
+        if PLATFORM == "ESP32" and self.mqtt_client:
+            try:
+                self.mqtt_client.check_msg()
+            except OSError as e:
+                print("[BossHub MQTT] Connection lost. Reconnecting...")
+                self.reconnect_mqtt()
+
+    def reconnect_mqtt(self):
+        """ระบบกู้ชีพ Connection สำหรับ ESP32"""
+        try:
+            time.sleep(2)
+            self.mqtt_client.connect()
+            # ต้อง Subscribe ใหม่ทั้งหมดถ้าหลุด
+            self.subscribe(f"bosshub/devices/{self.device_id}/command")
+            print("[BossHub MQTT] Reconnected!")
+        except Exception as e:
+            print(f"[BossHub MQTT] Reconnect failed: {e}")
+
+    # --- Internal MQTT Wrappers ---
+    def _on_mqtt_message_wrapper(self, topic, msg):
+        """ตัวกลางแปลงข้อมูลก่อนส่งให้ User (ESP32)"""
+        topic_str = topic.decode()
+        msg_str = msg.decode()
+        self._process_message(topic_str, msg_str)
+
+    def _on_paho_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            print("[BossHub MQTT] Paho Connected Success.")
+        else:
+            print(f"[BossHub MQTT] Connection Refused code={rc}")
+
+    def _on_paho_message(self, client, userdata, msg):
+        """ตัวกลางแปลงข้อมูลก่อนส่งให้ User (PC)"""
+        self._process_message(msg.topic, msg.payload.decode())
+
+    def _process_message(self, topic, payload_str):
+        """Logic กลางในการจัดการข้อความขาเข้า"""
+        # 1. พยายามแปลง JSON
+        try:
+            data = json.loads(payload_str)
+        except:
+            data = payload_str # ถ้าไม่ใช่ JSON ก็ส่งเป็น String ดิบ
+
+        print(f"[MSG] Topic: {topic} | Data: {data}")
+
+        # 2. ถ้ามี Callback เฉพาะ Topic นั้น ให้เรียกใช้
+        if topic in self.mqtt_callbacks:
+            self.mqtt_callbacks[topic](data)
+        
+        # 3. ถ้าไม่มี หรือเป็น Global Callback ให้เรียกตัวหลัก
+        elif self.user_on_message:
+            self.user_on_message(topic, data)
+
+    # ==========================================
+    # PART 2: EXISTING HTTP HELPERS (ยังคงไว้)
+    # ==========================================
     def _post(self, endpoint, payload):
-        """Internal Safe Request with Error Handling"""
         try:
             url = f"{self.base_url}/{endpoint}"
-            # เพิ่ม Timestamp ป้องกัน Replay Attack
             payload['ts'] = time.time()
             payload['device_id'] = self.device_id
-            
-            # Timeout 10s เพื่อป้องกันโปรแกรมค้าง
-            response = requests.post(url, headers=self.headers, data=json.dumps(payload), timeout=10)
-            
+            response = requests.post(url, headers=self.headers, data=json.dumps(payload), timeout=5)
             if response.status_code in [200, 201]:
                 return response.json()
-            else:
-                print(f"[BossHub Error] API {response.status_code}: {response.text}")
-                return None
-        except Exception as e:
-            print(f"[BossHub Exception] Network Error: {e}")
+            return None
+        except Exception:
             return None
 
-    # ==========================================
-    # 1. CORE IoT FUNCTIONS (พื้นฐาน)
-    # ==========================================
     def heartbeat(self):
-        """ส่งสัญญาณชีพ บอก Server ว่าเครื่องยังออนไลน์"""
+        # ส่งทั้ง MQTT และ HTTP เพื่อความชัวร์ (Redundant)
+        self.publish(f"bosshub/devices/{self.device_id}/status", {"status": "online", "ts": time.time()})
         return self._post("device/heartbeat", {})
 
-    def update_status(self, state, error_code=None):
-        """
-        อัปเดตสถานะเครื่อง
-        state: 'IDLE', 'BUSY', 'ERROR', 'OFFLINE'
-        """
-        payload = {"state": state}
-        if error_code:
-            payload["error_code"] = error_code
-        return self._post("device/status", payload)
-
     def log(self, message, level="INFO"):
-        """ส่ง Log เข้า Cloud แทนการ print ดูหน้าจอ"""
-        print(f"[{level}] {message}") 
-        return self._post("device/log", {"level": level, "message": message})
+        print(f"[{level}] {message}")
+        self.publish(f"bosshub/devices/{self.device_id}/log", {"level": level, "msg": message})
 
-    # ==========================================
-    # 2. PAYMENT & COMMERCE (การเงิน/ขายของ)
-    # ==========================================
-    def check_payment(self, ref_code):
-        """
-        เช็คว่าลูกค้ายิง QR จ่ายเงินหรือยัง (สำหรับตู้ Vending/ซักผ้า)
-        Return: True ถ้าจ่ายแล้ว, False ถ้ายัง
-        """
-        res = self._post("payment/check", {"ref_code": ref_code})
-        if res and res.get("status") == "paid":
-            return True
-        return False
-
-    def report_sale(self, product_id, price, payment_method="QR"):
-        """
-        บันทึกยอดขายและตัดสต็อก (POS/Vending)
-        """
-        payload = {
-            "product_id": product_id,
-            "amount": price,
-            "method": payment_method
-        }
-        return self._post("sales/record", payload)
-
-    def get_product_info(self, product_id):
-        """ดึงราคาและชื่อสินค้าจาก Server (ไม่ต้อง Hardcode ในเครื่อง)"""
-        res = self._post("product/info", {"product_id": product_id})
-        return res # Return Dict {name: "Coke", price: 15}
-
-    # ==========================================
-    # 3. MAINTENANCE & CONFIG (ดูแลรักษา)
-    # ==========================================
-    def get_config(self, key, default=None):
-        """
-        ดึงค่าตั้งค่าจาก Cloud (เช่น ราคาซัก, อุณหภูมิตู้แช่)
-        ทำให้เปลี่ยนค่าได้โดยไม่ต้องไปแก้โค้ดหน้างาน
-        """
-        res = self._post("device/config", {"key": key})
-        if res and "value" in res:
-            return res["value"]
-        return default
-
-    def check_ota_update(self, current_version):
-        """เช็คว่ามี Firmware ใหม่ไหม (สำหรับ ESP32)"""
-        res = self._post("firmware/check", {"version": current_version})
-        if res and res.get("has_update"):
-            return res.get("firmware_url")
-        return None
-
-# --- Quick Connect Helper ---
-def connect(api_key=None):
-    return Client(api_key)
+# --- Helper ---
+def connect(api_key=None, mqtt_host=DEFAULT_MQTT_HOST):
+    return Client(api_key=api_key, mqtt_host=mqtt_host)
